@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # QQQM Investment Research Assistant
 
 一个面向个人学习与研究的 Python 项目。第一阶段包含：
@@ -94,3 +95,7 @@ git push -u origin main
 ```
 
 请先检查 `git status`，并确认 `.env`、数据库文件和生成报告没有进入待提交列表。
+=======
+# qqqm-investment-assistant
+Personal investment research assistant with market data, DeepSeek analysis and backtesting
+>>>>>>> 54b23f7bbcd945925768b6b2ef347dfa66943c58
