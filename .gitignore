@@ -1,0 +1,41 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local market database and generated reports
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+ reports/*.md
+ reports/*.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Python virtual environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local market database
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Generated research reports
+reports/*.md
