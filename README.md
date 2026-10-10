@@ -1,101 +1,86 @@
-<<<<<<< HEAD
+
 # QQQM Investment Research Assistant
 
-一个面向个人学习与研究的 Python 项目。第一阶段包含：
+一个面向个人投资学习与研究的 Python 项目。以 QQQM 为主要研究对象，结合历史行情、技术指标与大语言模型，帮助投资新手理解市场变化、交易成本和策略回测。
 
-- 使用 `yfinance` 获取 QQQM、QQQ、SPY、TLT 的历史日线数据；
-- 将行情增量保存到本地 SQLite 数据库；
-- 计算基础技术指标；
-- 使用 DeepSeek API 基于已计算的数据生成中文研究报告。
+## 当前功能
 
-> 注意：`yfinance` 是第三方开源工具，使用公开的 Yahoo Finance 接口，主要定位于研究和教育。请自行遵守数据源条款。本项目不是自动交易程序，不构成投资建议。第一版没有接入实时新闻或宏观经济数据，也不应将模型内容当作可靠的价格预测。
+- 使用 EODHD API 获取 QQQM 历史日线行情。
+- 使用 SQLite 保存本地行情数据。
+- 增量更新行情并查看数据库状态。
+- 计算历史收益率、移动平均线、RSI 和波动率等指标。
+- 使用 DeepSeek API 生成中文市场研究报告。
+- 将研究报告保存为 Markdown 文件。
 
-## 环境要求
+## 技术栈
 
-建议 Python 3.12 或 3.13。Windows 11 + VS Code + PowerShell 可以按以下步骤运行。
+- Python 3.11
+- SQLite
+- Pandas
+- EODHD API
+- DeepSeek API
+- yfinance（早期数据源，当前默认使用 EODHD）
 
-### 1. 创建虚拟环境并安装依赖
+## 环境配置
 
-```powershell
-py -0p
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+建议使用 Windows、VS Code 和 Python 3.11。
 
-如果电脑没有 Python 3.12，请安装它，或把命令中的 `-3.12` 改为电脑上已有且能正常安装依赖的版本。
+在项目根目录创建虚拟环境：
 
-### 2. 配置 DeepSeek API
+    uv venv --python 3.11 .venv
 
-```powershell
-Copy-Item .env.example .env
-```
+安装依赖：
 
-用 VS Code 打开 `.env`，将 `DEEPSEEK_API_KEY` 替换成自己在 DeepSeek 平台创建的密钥。不要将 `.env` 上传到 GitHub，不要把密钥贴到聊天、截图或代码中。
+    uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 
-默认配置：
+## API 配置
 
-```text
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
-```
+复制配置模板：
 
-如果控制台返回模型不可用，请进入 DeepSeek 开放平台查看该 API Key 当前可用的模型名，并修改 `.env` 中的 `DEEPSEEK_MODEL`。
+    Copy-Item .env.example .env
 
-### 3. 首次下载历史行情
+在本地 `.env` 文件中填写自己的 API Key：
 
-```powershell
-python main.py sync --period 5y
-```
+    DEEPSEEK_API_KEY=your_deepseek_api_key
+    DEEPSEEK_BASE_URL=https://api.deepseek.com
+    DEEPSEEK_MODEL=deepseek-flash
 
-默认同步 `QQQM,QQQ,SPY,TLT`。第一次下载需要网络连接；Yahoo 接口可能偶尔限流或不可用，可以过一会儿重试。
+    MARKET_DATA_PROVIDER=eodhd
+    EODHD_API_KEY=your_eodhd_api_key
 
-只想先试 QQQM：
+不要将 `.env` 上传到 GitHub，也不要在代码中硬编码 API Key。
 
-```powershell
-python main.py sync --period 5y --tickers QQQM
-```
+## 运行方法
 
-### 4. 检查数据库
+同步 QQQM 一年历史日线：
 
-```powershell
-python main.py status
-```
+    .\.venv\Scripts\python.exe main.py sync --period 1y --tickers QQQM
 
-本地数据库位于 `data/market_data.db`，不会提交到 GitHub。
+检查本地行情数据库：
 
-### 5. 先计算指标，不调用 AI
+    .\.venv\Scripts\python.exe main.py status
 
-```powershell
-python main.py analyze --ticker QQQM --no-ai
-```
+计算指标，不调用 AI：
 
-### 6. 生成 DeepSeek 报告
+    .\.venv\Scripts\python.exe main.py analyze --ticker QQQM --no-ai
 
-确保 `.env` 里的 API Key 已配置，然后执行：
+生成 DeepSeek 研究报告：
 
-```powershell
-python main.py analyze --ticker QQQM
-```
+    .\.venv\Scripts\python.exe main.py analyze --ticker QQQM
 
-报告会写入 `reports/` 文件夹。第一版只分析已下载的历史行情，不会搜索最新新闻。
+行情数据库保存在本地 `data/` 目录，生成的报告保存在 `reports/` 目录。上述本地数据不应提交到公开仓库。
 
-## GitHub 建仓建议
+## 后续计划
 
-在 GitHub 新建一个 **Private** 仓库，例如 `qqqm-investment-assistant`。如果你已经用这个本地目录和 README，请创建空仓库，不要再勾选自动生成 README、`.gitignore` 或 License，以免首次推送时出现无关冲突。之后：
+- 接入 FRED 宏观经济数据。
+- 获取美联储公告、通胀数据及可靠财经新闻。
+- 建立个人交易记录和手续费核算模块。
+- 完善网格交易回测、权益曲线和最大回撤计算。
+- 使用严格的历史滚动测试评估预测模型。
 
-```powershell
-git init
-git add .
-git commit -m "Initial project scaffold"
-git branch -M main
-git remote add origin https://github.com/YOUR_GITHUB_USERNAME/qqqm-investment-assistant.git
-git push -u origin main
-```
+## 免责声明
 
-请先检查 `git status`，并确认 `.env`、数据库文件和生成报告没有进入待提交列表。
-=======
-# qqqm-investment-assistant
-Personal investment research assistant with market data, DeepSeek analysis and backtesting
->>>>>>> 54b23f7bbcd945925768b6b2ef347dfa66943c58
+本项目仅用于金融教育、个人研究和软件开发学习，不构成投资建议。技术指标及 AI 输出不能保证未来市场走势。
+
+历史回测结果不代表未来收益。使用者应自行核验数据来源、数据授权、交易费用及分析结论。
+
