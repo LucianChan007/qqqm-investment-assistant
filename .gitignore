@@ -43,3 +43,6 @@ reports/*.md
 reports/
 data/market_data.db*
 data/QQQM_tiingo_history.csv
+
+# One-time local database repair utility
+repair_macro_tables.py
