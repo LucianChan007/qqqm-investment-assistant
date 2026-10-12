@@ -2,4 +2,5 @@ yfinance>=0.2.65
 pandas>=2.2.0
 openai>=1.60.0
 python-dotenv>=1.0.1
-requests>=2.32.0
+requests>=2.32.0streamlit
+altair

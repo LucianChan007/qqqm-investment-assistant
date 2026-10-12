@@ -39,3 +39,7 @@ data/*.sqlite3
 
 # Generated research reports
 reports/*.md
+*.bak
+reports/
+data/market_data.db*
+data/QQQM_tiingo_history.csv
