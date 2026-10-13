@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import sqlite3
 import subprocess
 import sys
+from datetime import date
+from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +20,20 @@ import streamlit as st
 # Paths and page configuration
 # -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.portfolio import (
+    PortfolioValidationError,
+    build_scenario_table,
+    calculate_portfolio,
+    validate_transactions,
+)
+
 DB_PATH = ROOT / "data" / "market_data.db"
 HISTORY_PATH = ROOT / "data" / "QQQM_tiingo_history.csv"
 REPORT_DIR = ROOT / "reports"
+PORTFOLIO_TRANSACTIONS_PATH = ROOT / "data" / "portfolio_transactions.csv"
 
 st.set_page_config(
     page_title="QQQM Investment Assistant",
@@ -128,6 +143,44 @@ def load_market_data() -> pd.DataFrame:
             conn,
             params=("QQQM",),
         )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_latest_market_prices(tickers: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Return the latest locally stored close per ticker and its trade date."""
+    if not DB_PATH.exists() or not tickers:
+        return {}
+
+    cleaned = tuple(sorted({str(t).strip().upper() for t in tickers if str(t).strip()}))
+    if not cleaned:
+        return {}
+
+    placeholders = ",".join("?" for _ in cleaned)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            frame = pd.read_sql_query(
+                f"SELECT ticker, trade_date, close FROM market_daily "
+                f"WHERE UPPER(ticker) IN ({placeholders}) ORDER BY trade_date",
+                conn,
+                params=cleaned,
+            )
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return {}
+
+    if frame.empty:
+        return {}
+    frame["ticker"] = frame["ticker"].astype(str).str.upper()
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date", "close"]).sort_values("trade_date")
+    latest: dict[str, dict[str, Any]] = {}
+    for ticker, group in frame.groupby("ticker", sort=False):
+        row = group.iloc[-1]
+        latest[ticker] = {
+            "price": float(row["close"]),
+            "date": row["trade_date"].strftime("%Y-%m-%d"),
+        }
+    return latest
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -267,8 +320,15 @@ st.title("📈 QQQM Investment Assistant")
 st.caption("个人投资研究平台 · 行情分析 · AI 报告 · 策略回测")
 st.warning("本工具用于学习、研究和历史回测，不构成投资建议。历史表现不代表未来结果。")
 
-market_tab, report_tab, backtest_tab, macro_tab, status_tab = st.tabs(
-    ["📊 市场概览", "🧠 AI 分析", "⚙️ 策略回测", "🌎 宏观与新闻", "🗄️ 数据状态"]
+market_tab, report_tab, portfolio_tab, backtest_tab, macro_tab, status_tab = st.tabs(
+    [
+        "📊 市场概览",
+        "🧠 AI 分析",
+        "👛 我的投资组合",
+        "⚙️ 策略回测",
+        "🌎 宏观与新闻",
+        "🗄️ 数据状态",
+    ]
 )
 
 
@@ -396,7 +456,630 @@ with report_tab:
 
 
 # -----------------------------------------------------------------------------
-# 3. Rolling-grid backtest and visualization
+# 3. Personal portfolio import, accounting and scenario analysis
+# -----------------------------------------------------------------------------
+with portfolio_tab:
+    st.subheader("我的投资组合")
+    st.caption(
+        "支持手动录入单笔交易，也支持上传 CSV。手动记录只保存在当前电脑的本地文件中；"
+        "不会自动上传到 AI 服务或远程数据库。"
+    )
+    st.info(
+        "第一版支持买入、卖出和现金分红；成本采用加权平均成本法。"
+        "估值价格优先读取本地数据库最近收盘价（仅对 USD 标的自动填入），并允许手动修改。"
+        "不同币种分开计算，不会未经汇率换算就直接相加。"
+    )
+
+    template_columns = [
+        "trade_date", "ticker", "side", "quantity", "price", "fee",
+        "currency", "amount", "trade_id", "notes",
+    ]
+    blank_template = pd.DataFrame(columns=template_columns).to_csv(
+        index=False
+    ).encode("utf-8-sig")
+    st.download_button(
+        "下载空白交易记录模板 CSV",
+        data=blank_template,
+        file_name="portfolio_template.csv",
+        mime="text/csv",
+        key="download_portfolio_template",
+    )
+
+    st.caption(
+        f"本地交易记录文件：{PORTFOLIO_TRANSACTIONS_PATH.relative_to(ROOT)}。"
+        "请勿把个人交易记录提交到公开 GitHub 仓库。"
+    )
+    source_mode = st.radio(
+        "选择录入方式",
+        ["手动录入（本地保存）", "上传 CSV（临时分析）"],
+        horizontal=True,
+        key="portfolio_source_mode",
+    )
+
+    raw_transactions = pd.DataFrame(columns=template_columns)
+
+    if source_mode == "手动录入（本地保存）":
+        st.markdown("#### 添加一笔交易")
+        st.write(
+            "例如：买入 2 股 QQQM，成交价 290.53 美元。"
+            "请填写实际成交日期；历史交易不能一律填今天，否则已实现盈亏和持仓顺序会算错。"
+        )
+
+        side_label = st.selectbox(
+            "交易类型",
+            ["买入", "卖出", "现金分红"],
+            key="portfolio_manual_side",
+        )
+        side_value = {"买入": "BUY", "卖出": "SELL", "现金分红": "DIVIDEND"}[side_label]
+
+        with st.form("portfolio_manual_transaction_form", clear_on_submit=True):
+            date_col, ticker_col, currency_col = st.columns(3)
+            with date_col:
+                manual_trade_date = st.date_input(
+                    "实际成交日期",
+                    value=date.today(),
+                    help="建议填写券商交易记录里的成交日期。",
+                )
+            with ticker_col:
+                manual_ticker = st.text_input("证券代码", value="QQQM").strip().upper()
+            with currency_col:
+                manual_currency = st.text_input("交易币种", value="USD").strip().upper()
+
+            manual_quantity = 0.0
+            manual_price = 0.0
+            manual_amount = 0.0
+            if side_value in {"BUY", "SELL"}:
+                quantity_col, price_col, fee_col = st.columns(3)
+                with quantity_col:
+                    manual_quantity = st.number_input(
+                        "股数 / 数量",
+                        min_value=0.0,
+                        value=2.0,
+                        step=1.0,
+                        format="%.6f",
+                        help="例如买入或卖出 2 股，就填 2。",
+                    )
+                with price_col:
+                    manual_price = st.number_input(
+                        "每股成交价",
+                        min_value=0.0,
+                        value=290.53,
+                        step=0.01,
+                        format="%.4f",
+                    )
+                with fee_col:
+                    manual_fee = st.number_input(
+                        "手续费（总额）",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.01,
+                        format="%.4f",
+                    )
+            else:
+                amount_col, fee_col = st.columns(2)
+                with amount_col:
+                    manual_amount = st.number_input(
+                        "本次现金分红总额",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.01,
+                        format="%.4f",
+                    )
+                with fee_col:
+                    manual_fee = st.number_input(
+                        "分红相关费用（如有）",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.01,
+                        format="%.4f",
+                    )
+
+            manual_notes = st.text_input(
+                "备注（选填）",
+                placeholder="例如：众安银行成交记录 / 分批买入",
+            )
+            submitted = st.form_submit_button(
+                "保存这笔交易",
+                type="primary",
+                use_container_width=True,
+            )
+
+        # Read the saved local ledger before processing an added transaction.
+        if PORTFOLIO_TRANSACTIONS_PATH.exists():
+            try:
+                saved_transactions = pd.read_csv(
+                    PORTFOLIO_TRANSACTIONS_PATH,
+                    encoding="utf-8-sig",
+                )
+            except Exception as exc:
+                saved_transactions = pd.DataFrame(columns=template_columns)
+                st.error(f"读取本地交易记录失败：{type(exc).__name__}: {exc}")
+        else:
+            saved_transactions = pd.DataFrame(columns=template_columns)
+
+        if submitted:
+            new_row = {
+                "trade_date": manual_trade_date.isoformat(),
+                "ticker": manual_ticker,
+                "side": side_value,
+                "quantity": manual_quantity if side_value in {"BUY", "SELL"} else 0.0,
+                "price": manual_price if side_value in {"BUY", "SELL"} else 0.0,
+                "fee": float(manual_fee),
+                "currency": manual_currency,
+                "amount": manual_amount if side_value == "DIVIDEND" else 0.0,
+                "trade_id": uuid4().hex[:16],
+                "notes": manual_notes.strip(),
+            }
+            candidate = pd.concat(
+                [saved_transactions.reindex(columns=template_columns), pd.DataFrame([new_row])],
+                ignore_index=True,
+            )
+            try:
+                # Validate both row fields and chronological position consistency before saving.
+                normalized_candidate, duplicate_warnings = validate_transactions(candidate)
+                calculate_portfolio(candidate)
+                PORTFOLIO_TRANSACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                candidate.to_csv(
+                    PORTFOLIO_TRANSACTIONS_PATH,
+                    index=False,
+                    encoding="utf-8-sig",
+                )
+                saved_transactions = candidate
+                st.success(
+                    f"已保存：{manual_trade_date.isoformat()} · {manual_ticker} · "
+                    f"{side_label}。当前本地共有 {len(candidate)} 笔记录。"
+                )
+                for warning in duplicate_warnings:
+                    st.warning(warning)
+            except PortfolioValidationError as exc:
+                st.error("这笔交易没有保存，因为记录校验未通过：")
+                for error in exc.errors:
+                    st.write(f"- {error}")
+            except Exception as exc:
+                st.error(f"保存交易失败：{type(exc).__name__}: {exc}")
+
+        # Refresh the stored ledger after a successful save.
+        if PORTFOLIO_TRANSACTIONS_PATH.exists():
+            try:
+                saved_transactions = pd.read_csv(
+                    PORTFOLIO_TRANSACTIONS_PATH,
+                    encoding="utf-8-sig",
+                )
+            except Exception:
+                pass
+
+        if not saved_transactions.empty:
+            st.markdown("#### 本地交易记录")
+            try:
+                normalized_saved, saved_warnings = validate_transactions(saved_transactions)
+                for warning in saved_warnings:
+                    st.warning(warning)
+            except PortfolioValidationError as exc:
+                st.error("本地记录存在校验问题，暂时不能进行持仓分析。")
+                for error in exc.errors:
+                    st.write(f"- {error}")
+                normalized_saved = pd.DataFrame()
+
+            st.dataframe(
+                saved_transactions.sort_values("trade_date", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if not saved_transactions.empty:
+                id_to_label = {}
+                for _, row in saved_transactions.iterrows():
+                    trade_id = str(row.get("trade_id", ""))
+                    label = (
+                        f"{row.get('trade_date', '')} | {row.get('ticker', '')} | "
+                        f"{row.get('side', '')} | qty={row.get('quantity', '')} | "
+                        f"price={row.get('price', '')} | ID={trade_id}"
+                    )
+                    if trade_id:
+                        id_to_label[trade_id] = label
+
+                if id_to_label:
+                    with st.expander("删除录错的交易记录"):
+                        st.warning("删除后会立即更新本地记录。若只是价格或日期填错，也可以先删除，再重新录入。")
+                        with st.form("portfolio_delete_transaction_form"):
+                            selected_trade_id = st.selectbox(
+                                "选择要删除的交易",
+                                options=list(id_to_label),
+                                format_func=lambda value: id_to_label[value],
+                            )
+                            confirm_delete = st.checkbox("我确认删除所选记录")
+                            delete_submitted = st.form_submit_button("删除所选记录")
+                        if delete_submitted:
+                            if not confirm_delete:
+                                st.warning("请先勾选确认框。")
+                            else:
+                                remaining = saved_transactions[
+                                    saved_transactions["trade_id"].astype(str) != selected_trade_id
+                                ].copy()
+                                remaining.to_csv(
+                                    PORTFOLIO_TRANSACTIONS_PATH,
+                                    index=False,
+                                    encoding="utf-8-sig",
+                                )
+                                st.success("已删除所选记录。")
+                                st.rerun()
+
+            raw_transactions = saved_transactions.copy()
+        else:
+            st.info("还没有本地交易记录。用上面的表单添加一笔交易即可，不需要制作 CSV。")
+
+    else:
+        st.markdown("#### 上传交易记录 CSV")
+        st.caption("CSV 只用于本次页面分析，不会自动保存到本地交易记录。")
+        uploaded_file = st.file_uploader(
+            "上传交易记录 CSV",
+            type=["csv"],
+            key="portfolio_transaction_upload",
+            help="适合已有交易历史的用户；也可以切回手动录入。",
+        )
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.getvalue()
+            try:
+                raw_transactions = pd.read_csv(
+                    io.BytesIO(file_bytes),
+                    encoding="utf-8-sig",
+                )
+            except UnicodeDecodeError:
+                try:
+                    raw_transactions = pd.read_csv(
+                        io.BytesIO(file_bytes),
+                        encoding="gb18030",
+                    )
+                except Exception as exc:
+                    st.error(f"无法解析 CSV 编码：{exc}")
+            except Exception as exc:
+                st.error(f"读取 CSV 失败：{type(exc).__name__}: {exc}")
+
+    if raw_transactions.empty:
+        if source_mode == "上传 CSV（临时分析）":
+            st.info("上传 CSV 后，可以先预览并验证记录，再计算持仓分析。")
+        else:
+            st.info("请先保存至少一笔本地交易记录，然后即可计算持仓与盈亏。")
+    else:
+        # A deterministic fingerprint prevents calculations from mixing stale results
+        # when the transaction input changes, regardless of whether it came from a file or a form.
+        fingerprint_source = raw_transactions.to_csv(index=False).encode("utf-8")
+        file_fingerprint = hashlib.sha256(fingerprint_source).hexdigest()[:12]
+        result_key = f"portfolio_result_{file_fingerprint}"
+        price_editor_key = f"portfolio_price_editor_{file_fingerprint}"
+        st.subheader("交易记录预览")
+        st.dataframe(
+            raw_transactions.head(20),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        try:
+            normalized_preview, preview_warnings = validate_transactions(
+                raw_transactions
+            )
+            st.success(
+                f"基础校验通过：{len(normalized_preview)} 条交易记录，"
+                f"涉及 {normalized_preview['ticker'].nunique()} 个标的。"
+            )
+            for warning in preview_warnings:
+                st.warning(warning)
+            valid_upload = True
+        except PortfolioValidationError as exc:
+            valid_upload = False
+            st.error("交易记录未通过校验，请修正 CSV 后重新上传。")
+            for error in exc.errors:
+                st.write(f"- {error}")
+            normalized_preview = pd.DataFrame()
+            preview_warnings = []
+
+        if valid_upload:
+            ticker_currency_pairs = (
+                normalized_preview[["ticker", "currency"]]
+                .drop_duplicates()
+                .sort_values(["ticker", "currency"])
+                .reset_index(drop=True)
+            )
+            tickers = tuple(sorted(normalized_preview["ticker"].unique().tolist()))
+            market_prices = load_latest_market_prices(tickers)
+
+            price_rows = []
+            for _, pair in ticker_currency_pairs.iterrows():
+                ticker = str(pair["ticker"])
+                currency = str(pair["currency"])
+                market_record = market_prices.get(ticker) if currency == "USD" else None
+                db_price = market_record["price"] if market_record else None
+                db_date = market_record["date"] if market_record else "无本地数据"
+                price_rows.append({
+                    "ticker": ticker,
+                    "currency": currency,
+                    "数据库最近收盘价": db_price,
+                    "数据库交易日期": db_date,
+                    "估值使用价格": db_price,
+                })
+
+            price_input = pd.DataFrame(price_rows)
+            st.subheader("估值价格")
+            st.caption(
+                "数据库价格只是本地保存的最近收盘价，并非实时价格。"
+                "非 USD 币种不会自动套用数据库价格；缺少价格时请手动填写。"
+            )
+            edited_prices = st.data_editor(
+                price_input,
+                key=price_editor_key,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["ticker", "currency", "数据库最近收盘价", "数据库交易日期"],
+                column_config={
+                    "ticker": st.column_config.TextColumn("证券代码", disabled=True),
+                    "currency": st.column_config.TextColumn("币种", disabled=True),
+                    "数据库最近收盘价": st.column_config.NumberColumn(
+                        "数据库最近收盘价", format="%.4f", disabled=True
+                    ),
+                    "数据库交易日期": st.column_config.TextColumn(
+                        "数据库交易日期", disabled=True
+                    ),
+                    "估值使用价格": st.column_config.NumberColumn(
+                        "估值使用价格（可编辑）", min_value=0.000001, format="%.4f", step=0.01
+                    ),
+                },
+            )
+
+            current_prices: dict[tuple[str, str], float] = {}
+            for _, price_row in edited_prices.iterrows():
+                value = pd.to_numeric(
+                    pd.Series([price_row.get("估值使用价格")]), errors="coerce"
+                ).iloc[0]
+                if pd.notna(value) and float(value) > 0:
+                    current_prices[(
+                        str(price_row["ticker"]).upper(),
+                        str(price_row["currency"]).upper(),
+                    )] = float(value)
+
+            price_signature = tuple(
+                sorted((ticker, currency, round(price, 8))
+                       for (ticker, currency), price in current_prices.items())
+            )
+
+            calculate_clicked = st.button(
+                "计算持仓与盈亏",
+                type="primary",
+                key=f"calculate_portfolio_{file_fingerprint}",
+            )
+            calculated_before = st.session_state.get(result_key)
+            auto_recalculate = (
+                calculated_before is not None
+                and calculated_before.get("price_signature") != price_signature
+            )
+
+            if calculate_clicked or auto_recalculate:
+                try:
+                    status_message = (
+                        "估值价格已更新，正在自动重算持仓……"
+                        if auto_recalculate and not calculate_clicked
+                        else "正在校验交易顺序并计算持仓……"
+                    )
+                    with st.spinner(status_message):
+                        calculation = calculate_portfolio(
+                            raw_transactions, current_prices=current_prices
+                        )
+                    st.session_state[result_key] = {
+                        "transactions": calculation.transactions,
+                        "positions": calculation.positions,
+                        "warnings": calculation.warnings,
+                        "price_signature": price_signature,
+                    }
+                    if auto_recalculate and not calculate_clicked:
+                        st.success("估值价格已变化，持仓市值与盈亏已自动更新。")
+                    else:
+                        st.success("持仓计算完成。")
+                except PortfolioValidationError as exc:
+                    st.error("无法完成持仓计算，请检查交易记录。")
+                    for error in exc.errors:
+                        st.write(f"- {error}")
+                except Exception as exc:
+                    st.error(f"持仓计算发生意外错误：{type(exc).__name__}: {exc}")
+
+            calculated = st.session_state.get(result_key)
+            if calculated:
+                st.divider()
+                st.subheader("持仓分析结果")
+                if calculated.get("price_signature") != price_signature:
+                    st.warning("估值价格与上次计算时不同。请再次点击“计算持仓与盈亏”以更新结果。")
+                for warning in calculated.get("warnings", []):
+                    st.warning(warning)
+
+                positions = calculated["positions"].copy()
+                transaction_results = calculated["transactions"].copy()
+
+                if positions.empty:
+                    st.info("没有可汇总的持仓记录。")
+                else:
+                    currencies = sorted(positions["currency"].dropna().unique().tolist())
+                    for currency in currencies:
+                        currency_positions = positions[positions["currency"] == currency]
+                        open_positions = currency_positions[
+                            currency_positions["open_position"].astype(bool)
+                        ]
+                        missing_market_prices = (
+                            not open_positions.empty
+                            and open_positions["current_price"].isna().any()
+                        )
+                        st.markdown(f"#### {currency} 账户概览")
+                        if open_positions.empty:
+                            market_value_total = 0.0
+                            unrealized_total = 0.0
+                        elif missing_market_prices:
+                            market_value_total = None
+                            unrealized_total = None
+                        else:
+                            market_value_total = float(open_positions["market_value"].sum())
+                            unrealized_total = float(open_positions["unrealized_pnl"].sum())
+
+                        remaining_cost = (
+                            float(open_positions["remaining_cost_basis"].sum())
+                            if not open_positions.empty else 0.0
+                        )
+                        realized_total = float(currency_positions["realized_pnl"].sum())
+                        dividends_total = float(currency_positions["dividend_income"].sum())
+                        cumulative_net_total = (
+                            realized_total + unrealized_total + dividends_total
+                            if unrealized_total is not None else None
+                        )
+                        total_fees = float(currency_positions["total_fees"].sum())
+
+                        # 简明视图：先呈现整体结果，再解释盈亏来源。
+                        metric_cols = st.columns(3)
+                        metric_cols[0].metric(
+                            "累计净盈亏",
+                            f"{cumulative_net_total:+,.2f} {currency}"
+                            if cumulative_net_total is not None else "缺少估值价格",
+                        )
+                        metric_cols[1].metric(
+                            "当前持仓市值",
+                            f"{market_value_total:,.2f} {currency}"
+                            if market_value_total is not None else "缺少估值价格",
+                        )
+                        metric_cols[2].metric("剩余持仓成本", f"{remaining_cost:,.2f} {currency}")
+
+                        detail_cols = st.columns(3)
+                        detail_cols[0].metric(
+                            "未实现盈亏",
+                            f"{unrealized_total:+,.2f} {currency}"
+                            if unrealized_total is not None else "暂不可计算",
+                        )
+                        detail_cols[1].metric("已实现盈亏", f"{realized_total:+,.2f} {currency}")
+                        detail_cols[2].metric("累计手续费", f"{total_fees:,.2f} {currency}")
+                        st.caption(
+                            f"当前持仓标的数：{len(open_positions)}。"
+                            f"累计分红净收入：{dividends_total:+,.2f} {currency}。"
+                            "累计净盈亏 = 已实现盈亏 + 未实现盈亏 + 分红净收入。"
+                            "买入手续费已计入持仓成本，卖出手续费已扣除卖出收入，"
+                            "分红手续费已从分红中扣除，因此不再重复扣减累计手续费。"
+                            "不同币种分开统计，没有合并换算。"
+                        )
+
+                    display_positions = positions.rename(columns={
+                        "ticker": "标的",
+                        "currency": "币种",
+                        "quantity": "持有数量",
+                        "average_cost": "加权平均成本",
+                        "remaining_cost_basis": "剩余持仓成本",
+                        "current_price": "估值使用价格",
+                        "market_value": "持仓市值",
+                        "unrealized_pnl": "未实现盈亏",
+                        "unrealized_pnl_pct": "未实现收益率(%)",
+                        "realized_pnl": "已实现盈亏",
+                        "dividend_income": "分红净收入",
+                        "realized_plus_dividends": "已实现盈亏与分红合计",
+                        "cumulative_net_pnl": "累计净盈亏",
+                        "equivalent_cost_per_share": "净收益调整后等效成本",
+                        "total_fees": "累计手续费",
+                        "open_position": "仍有持仓",
+                    })
+                    st.subheader("持仓明细")
+                    st.dataframe(
+                        display_positions,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "持有数量": st.column_config.NumberColumn(format="%.6f"),
+                            "加权平均成本": st.column_config.NumberColumn(format="%.4f"),
+                            "剩余持仓成本": st.column_config.NumberColumn(format="%.2f"),
+                            "估值使用价格": st.column_config.NumberColumn(format="%.4f"),
+                            "持仓市值": st.column_config.NumberColumn(format="%.2f"),
+                            "未实现盈亏": st.column_config.NumberColumn(format="%.2f"),
+                            "未实现收益率(%)": st.column_config.NumberColumn(format="%.2f"),
+                            "已实现盈亏": st.column_config.NumberColumn(format="%.2f"),
+                            "累计净盈亏": st.column_config.NumberColumn(format="%+.2f"),
+                            "净收益调整后等效成本": st.column_config.NumberColumn(format="%.4f"),
+                            "分红净收入": st.column_config.NumberColumn(format="%.2f"),
+                            "累计手续费": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+
+                    scenario_options = [-30, -20, -10, -5, 0, 5, 10, 20, 30]
+                    selected_scenarios = st.multiselect(
+                        "价格情景变化幅度（相对当前估值价格）",
+                        options=scenario_options,
+                        default=[-20, -10, -5, 0, 5, 10, 20],
+                        format_func=lambda value: f"{value:+d}%" if value else "0%",
+                        key=f"portfolio_scenarios_{file_fingerprint}",
+                    )
+                    scenario_df = build_scenario_table(positions, selected_scenarios)
+                    st.subheader("价格情景模拟")
+                    if scenario_df.empty:
+                        st.info("没有可模拟的未平仓标的。请补充有效估值价格，或确认是否仍有持仓。")
+                    else:
+                        scenario_display = scenario_df.rename(columns={
+                            "ticker": "标的",
+                            "currency": "币种",
+                            "price_change_pct": "价格变化(%)",
+                            "scenario_price": "情景价格",
+                            "scenario_market_value": "情景持仓市值",
+                            "scenario_unrealized_pnl": "情景未实现盈亏",
+                            "scenario_unrealized_pnl_pct": "情景未实现收益率(%)",
+                        })
+                        st.dataframe(
+                            scenario_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "价格变化(%)": st.column_config.NumberColumn(format="%+.1f%%"),
+                                "情景价格": st.column_config.NumberColumn(format="%.4f"),
+                                "情景持仓市值": st.column_config.NumberColumn(format="%.2f"),
+                                "情景未实现盈亏": st.column_config.NumberColumn(format="%+.2f"),
+                                "情景未实现收益率(%)": st.column_config.NumberColumn(format="%+.2f"),
+                            },
+                        )
+
+                    st.subheader("交易历史与已实现盈亏")
+                    transaction_columns = [
+                        "trade_date", "ticker", "side", "quantity", "price", "fee",
+                        "currency", "amount", "realized_pnl", "notes",
+                    ]
+                    available_columns = [c for c in transaction_columns if c in transaction_results.columns]
+                    tx_display = transaction_results[available_columns].rename(columns={
+                        "trade_date": "交易日期",
+                        "ticker": "标的",
+                        "side": "类型",
+                        "quantity": "数量",
+                        "price": "成交价",
+                        "fee": "手续费",
+                        "currency": "币种",
+                        "amount": "分红金额",
+                        "realized_pnl": "本笔已实现盈亏",
+                        "notes": "备注",
+                    })
+                    st.dataframe(
+                        tx_display.sort_values("交易日期", ascending=False),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    tx_csv = transaction_results.to_csv(index=False).encode("utf-8-sig")
+                    pos_csv = positions.to_csv(index=False).encode("utf-8-sig")
+                    dl_col1, dl_col2 = st.columns(2)
+                    dl_col1.download_button(
+                        "下载已处理交易记录 CSV",
+                        data=tx_csv,
+                        file_name="portfolio_transactions_calculated.csv",
+                        mime="text/csv",
+                        key=f"download_portfolio_tx_{file_fingerprint}",
+                    )
+                    dl_col2.download_button(
+                        "下载持仓分析结果 CSV",
+                        data=pos_csv,
+                        file_name="portfolio_positions.csv",
+                        mime="text/csv",
+                        key=f"download_portfolio_positions_{file_fingerprint}",
+                    )
+
+
+
+# -----------------------------------------------------------------------------
+# 4. Rolling-grid backtest and visualization
 # -----------------------------------------------------------------------------
 with backtest_tab:
     st.subheader("滚动网格策略回测")
@@ -838,7 +1521,7 @@ with backtest_tab:
 
 
 # -----------------------------------------------------------------------------
-# 4. Macro data, news and sync status
+# 5. Macro data, news and sync status
 # -----------------------------------------------------------------------------
 with macro_tab:
     st.subheader("宏观经济与官方新闻")

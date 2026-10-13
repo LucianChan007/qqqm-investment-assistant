@@ -46,3 +46,6 @@ data/QQQM_tiingo_history.csv
 
 # One-time local database repair utility
 repair_macro_tables.py
+
+# Personal portfolio transaction records
+data/portfolio_transactions.csv
