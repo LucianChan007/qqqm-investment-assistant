@@ -48,6 +48,20 @@ class PortfolioTests(unittest.TestCase):
         row = scenarios[scenarios["price_change_pct"] == 10].iloc[0]
         self.assertAlmostEqual(row["scenario_price"], 126.5, places=5)
         self.assertAlmostEqual(row["scenario_market_value"], 1518.0, places=5)
+        self.assertAlmostEqual(row["current_cumulative_net_pnl"], 192.0, places=3)
+        self.assertAlmostEqual(row["scenario_cumulative_net_pnl"], 330.0, places=3)
+        self.assertAlmostEqual(row["cumulative_pnl_change"], 138.0, places=3)
+        self.assertAlmostEqual(row["realized_pnl"], 48.6, places=3)
+        self.assertAlmostEqual(row["dividend_income"], 5.0, places=6)
+
+    def test_scenario_at_minus_100_percent_uses_zero_price(self):
+        result = calculate_portfolio(self.sample(), {"QQQM": 115})
+        scenarios = build_scenario_table(result.positions, [-100, -101])
+        self.assertEqual(len(scenarios), 1)
+        row = scenarios.iloc[0]
+        self.assertAlmostEqual(row["scenario_price"], 0.0, places=6)
+        self.assertAlmostEqual(row["scenario_market_value"], 0.0, places=6)
+        self.assertAlmostEqual(row["scenario_cumulative_net_pnl"], -1188.0, places=3)
 
     def test_invalid_transaction_date_is_rejected(self):
         frame = pd.DataFrame([

@@ -29,6 +29,8 @@ from app.portfolio import (
     calculate_portfolio,
     validate_transactions,
 )
+from app.decision_support import build_decision_assessment
+from app.portfolio_ai import generate_portfolio_analysis
 
 DB_PATH = ROOT / "data" / "market_data.db"
 HISTORY_PATH = ROOT / "data" / "QQQM_tiingo_history.csv"
@@ -317,6 +319,211 @@ def render_latest_report(pattern: str, *, title: str) -> None:
 # Header and navigation
 # -----------------------------------------------------------------------------
 st.title("📈 QQQM Investment Assistant")
+
+# >>> QQQM INVESTMENT OVERVIEW V0.4.0 >>>
+st.divider()
+st.header("投资总览")
+st.caption(
+    "先看整体赚亏和当前持仓；下方各标签页保留详细行情、AI 研究、持仓明细、回测与宏观数据。"
+)
+
+if not PORTFOLIO_TRANSACTIONS_PATH.exists():
+    st.info(
+        "还没有本地交易记录。请进入“我的投资组合”录入或导入交易记录，"
+        "投资总览就会根据记录和本地行情自动计算。"
+    )
+else:
+    try:
+        overview_raw = pd.read_csv(
+            PORTFOLIO_TRANSACTIONS_PATH,
+            encoding="utf-8-sig",
+        )
+        overview_tx, overview_warnings = validate_transactions(overview_raw)
+
+        overview_tickers = tuple(sorted(overview_tx["ticker"].unique().tolist()))
+        overview_market_prices = load_latest_market_prices(overview_tickers)
+        overview_current_prices: dict[tuple[str, str], float] = {}
+        overview_price_dates: dict[str, str] = {}
+
+        for _, overview_pair in overview_tx[["ticker", "currency"]].drop_duplicates().iterrows():
+            overview_ticker = str(overview_pair["ticker"]).upper()
+            overview_currency = str(overview_pair["currency"]).upper()
+            overview_record = (
+                overview_market_prices.get(overview_ticker)
+                if overview_currency == "USD"
+                else None
+            )
+            if overview_record and overview_record.get("price") is not None:
+                overview_current_prices[(overview_ticker, overview_currency)] = float(
+                    overview_record["price"]
+                )
+                overview_price_dates[overview_ticker] = str(
+                    overview_record.get("date", "未知日期")
+                )
+
+        overview_calculation = calculate_portfolio(
+            overview_raw,
+            current_prices=overview_current_prices,
+        )
+        overview_positions = overview_calculation.positions.copy()
+
+        for overview_warning in overview_warnings:
+            st.warning(overview_warning)
+
+        if overview_positions.empty:
+            st.info("交易记录已读取，但没有可展示的持仓汇总。")
+        else:
+            overview_currencies = sorted(
+                overview_positions["currency"].dropna().unique().tolist()
+            )
+
+            for overview_currency in overview_currencies:
+                overview_currency_positions = overview_positions[
+                    overview_positions["currency"] == overview_currency
+                ]
+                overview_open = overview_currency_positions[
+                    overview_currency_positions["open_position"].astype(bool)
+                ]
+                overview_missing_price = (
+                    not overview_open.empty
+                    and overview_open["current_price"].isna().any()
+                )
+
+                overview_cost = (
+                    float(overview_open["remaining_cost_basis"].sum())
+                    if not overview_open.empty
+                    else 0.0
+                )
+                overview_realized = float(
+                    overview_currency_positions["realized_pnl"].sum()
+                )
+                overview_dividends = float(
+                    overview_currency_positions["dividend_income"].sum()
+                )
+                overview_fees = float(
+                    overview_currency_positions["total_fees"].sum()
+                )
+                overview_value = (
+                    float(overview_open["market_value"].sum())
+                    if not overview_missing_price
+                    else None
+                )
+                overview_unrealized = (
+                    float(overview_open["unrealized_pnl"].sum())
+                    if not overview_missing_price
+                    else None
+                )
+                overview_cumulative = (
+                    overview_realized + overview_unrealized + overview_dividends
+                    if overview_unrealized is not None
+                    else None
+                )
+
+                st.subheader(f"{overview_currency} 投资结果")
+                overview_cols = st.columns(4)
+                if overview_cumulative is None:
+                    overview_cols[0].metric("累计净盈亏", "暂不可计算")
+                else:
+                    overview_cols[0].metric(
+                        "累计净盈亏",
+                        f"{overview_cumulative:+,.2f} {overview_currency}",
+                        help="已实现盈亏 + 当前未实现盈亏 + 净分红。手续费已按成本或净收入口径计入，不重复扣除。",
+                    )
+                overview_cols[1].metric(
+                    "当前持仓市值",
+                    f"{overview_value:,.2f} {overview_currency}"
+                    if overview_value is not None
+                    else "缺少估值价格",
+                )
+                overview_cols[2].metric(
+                    "当前浮动盈亏",
+                    f"{overview_unrealized:+,.2f} {overview_currency}"
+                    if overview_unrealized is not None
+                    else "暂不可计算",
+                )
+                overview_cols[3].metric(
+                    "剩余持仓成本",
+                    f"{overview_cost:,.2f} {overview_currency}",
+                )
+
+                if overview_cumulative is None:
+                    st.warning(
+                        "部分未平仓标的缺少可用估值价格，因此暂时不能得出可靠的累计净盈亏。"
+                    )
+                elif overview_cumulative > 0:
+                    st.success(
+                        f"简单结论：按当前已记录交易和最新可用行情，你的已记录投资净盈利 "
+                        f"{overview_cumulative:,.2f} {overview_currency}。"
+                    )
+                elif overview_cumulative < 0:
+                    st.error(
+                        f"简单结论：按当前已记录交易和最新可用行情，你的已记录投资净亏损 "
+                        f"{abs(overview_cumulative):,.2f} {overview_currency}。"
+                    )
+                else:
+                    st.info("简单结论：按当前记录计算，累计净盈亏约为零。")
+
+                st.caption(
+                    f"已实现盈亏 {overview_realized:+,.2f} {overview_currency}；"
+                    f"净分红 {overview_dividends:+,.2f} {overview_currency}；"
+                    f"累计记录手续费 {overview_fees:,.2f} {overview_currency}。"
+                    "手续费已包含在相应成本或净收入中，不应再扣一次。"
+                )
+
+                overview_table = overview_currency_positions.rename(columns={
+                    "ticker": "证券",
+                    "quantity": "持有数量",
+                    "current_price": "最新可用价格",
+                    "market_value": "当前持仓市值",
+                    "average_cost": "每股加权平均成本",
+                    "remaining_cost_basis": "剩余持仓成本",
+                    "unrealized_pnl": "当前浮动盈亏",
+                    "realized_pnl": "历史已实现盈亏",
+                    "dividend_income": "净分红",
+                    "cumulative_net_pnl": "累计净盈亏",
+                    "equivalent_cost_per_share": "净收益调整后等效成本",
+                    "open_position": "仍有持仓",
+                })
+                overview_cols_to_show = [
+                    "证券", "quantity", "持有数量", "最新可用价格", "当前持仓市值",
+                    "每股加权平均成本", "剩余持仓成本", "当前浮动盈亏",
+                    "历史已实现盈亏", "净分红", "累计净盈亏",
+                    "净收益调整后等效成本", "仍有持仓",
+                ]
+                overview_cols_to_show = [
+                    col for col in overview_cols_to_show if col in overview_table.columns
+                ]
+                st.dataframe(
+                    overview_table[overview_cols_to_show],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                overview_used_dates = [
+                    f"{ticker}: {market_date}"
+                    for ticker, market_date in sorted(overview_price_dates.items())
+                    if ticker in overview_tickers
+                ]
+                st.caption(
+                    "价格是本地数据库保存的最新可用日线收盘价，不是实时行情。"
+                    + (" 价格日期：" + "；".join(overview_used_dates) if overview_used_dates else " 当前没有可用的本地美元日线价格。")
+                )
+
+            st.caption(
+                "口径提示：累计净盈亏仅反映本地录入的交易、净分红与当前可用估值；"
+                "因未记录完整的账户入金、出金及现金余额，它不等同于银行账户的真实总回报率。"
+                "等效成本是解释性参考，不是券商税务成本、保本价或买卖目标价。"
+            )
+
+    except PortfolioValidationError as exc:
+        st.error("无法生成投资总览：本地交易记录未通过校验。")
+        for overview_error in exc.errors:
+            st.write(f"- {overview_error}")
+    except Exception as exc:
+        st.error(f"投资总览加载失败：{type(exc).__name__}: {exc}")
+
+# <<< QQQM INVESTMENT OVERVIEW V0.4.0 <<<
+
 st.caption("个人投资研究平台 · 行情分析 · AI 报告 · 策略回测")
 st.warning("本工具用于学习、研究和历史回测，不构成投资建议。历史表现不代表未来结果。")
 
@@ -893,6 +1100,75 @@ with portfolio_tab:
                 positions = calculated["positions"].copy()
                 transaction_results = calculated["transactions"].copy()
 
+                # --- Personal portfolio AI analysis (explicit consent required) ---
+                if not positions.empty:
+                    ai_report_state_key = f"portfolio_ai_report_{file_fingerprint}"
+                    ai_consent_key = f"portfolio_ai_consent_{file_fingerprint}"
+                    with st.expander("个人持仓 DeepSeek 分析", expanded=False):
+                        st.markdown(
+                            "生成一份结合实际持仓、交易汇总、价格情景及本地已保存市场/宏观/新闻证据的分析报告。"
+                        )
+                        st.warning(
+                            "隐私说明：勾选同意后，程序会将聚合持仓、按标的/币种/交易类型汇总的交易统计、"
+                            "价格情景，以及本地保存的市场/宏观/新闻上下文发送给 DeepSeek。"
+                            "不会发送交易 ID、备注或逐笔交易日期。请求由外部模型服务处理。"
+                        )
+                        result_prices_current = calculated.get("price_signature") == price_signature
+                        if not result_prices_current:
+                            st.warning("当前估值价格与已计算结果不同。请先点击“计算持仓与盈亏”，再生成 AI 报告。")
+                        consent = st.checkbox(
+                            "我已了解以上数据范围，并同意将这些汇总信息发送给 DeepSeek。",
+                            key=ai_consent_key,
+                            value=False,
+                        )
+                        generate_ai_clicked = st.button(
+                            "生成我的持仓分析",
+                            type="primary",
+                            key=f"generate_portfolio_ai_{file_fingerprint}",
+                            disabled=(not consent) or (not result_prices_current),
+                        )
+                        if generate_ai_clicked:
+                            try:
+                                with st.spinner("正在整理持仓摘要并请求 DeepSeek……"):
+                                    ai_report_path = generate_portfolio_analysis(
+                                        positions,
+                                        transaction_results,
+                                    )
+                                st.session_state[ai_report_state_key] = str(ai_report_path)
+                                st.success(f"分析报告已保存：{ai_report_path.name}")
+                            except Exception as exc:
+                                st.error(f"持仓 AI 分析失败：{type(exc).__name__}: {exc}")
+
+                        saved_ai_report = st.session_state.get(ai_report_state_key)
+                        if saved_ai_report:
+                            ai_path = Path(saved_ai_report)
+                            if ai_path.exists():
+                                st.download_button(
+                                    "下载个人持仓分析报告",
+                                    data=ai_path.read_bytes(),
+                                    file_name=ai_path.name,
+                                    mime="text/markdown",
+                                    key=f"download_portfolio_ai_{file_fingerprint}",
+                                )
+                                # >>> QQQM PORTFOLIO AI PLAIN LANGUAGE V0.4.0 >>>
+                                report_content = ai_path.read_text(encoding="utf-8")
+                                summary_start = report_content.find("## 一眼看懂")
+                                ai_section_start = report_content.find("## AI 解读：")
+                                if summary_start >= 0:
+                                    summary_end = (
+                                        ai_section_start
+                                        if ai_section_start > summary_start
+                                        else len(report_content)
+                                    )
+                                    summary_content = report_content[summary_start:summary_end].strip()
+                                    st.markdown(summary_content)
+                                    with st.expander("查看完整个人持仓分析报告"):
+                                        st.markdown(report_content)
+                                else:
+                                    with st.expander("查看最近生成的个人持仓分析"):
+                                        st.markdown(report_content)
+
+
                 if positions.empty:
                     st.info("没有可汇总的持仓记录。")
                 else:
@@ -1020,6 +1296,11 @@ with portfolio_tab:
                             "scenario_market_value": "情景持仓市值",
                             "scenario_unrealized_pnl": "情景未实现盈亏",
                             "scenario_unrealized_pnl_pct": "情景未实现收益率(%)",
+                            "realized_pnl": "历史已实现盈亏",
+                            "dividend_income": "历史净分红",
+                            "current_cumulative_net_pnl": "当前累计净盈亏",
+                            "scenario_cumulative_net_pnl": "情景累计净盈亏",
+                            "cumulative_pnl_change": "累计盈亏变化",
                         })
                         st.dataframe(
                             scenario_display,
@@ -1031,7 +1312,100 @@ with portfolio_tab:
                                 "情景持仓市值": st.column_config.NumberColumn(format="%.2f"),
                                 "情景未实现盈亏": st.column_config.NumberColumn(format="%+.2f"),
                                 "情景未实现收益率(%)": st.column_config.NumberColumn(format="%+.2f"),
+                                "历史已实现盈亏": st.column_config.NumberColumn(format="%+.2f"),
+                                "历史净分红": st.column_config.NumberColumn(format="%+.2f"),
+                                "当前累计净盈亏": st.column_config.NumberColumn(format="%+.2f"),
+                                "情景累计净盈亏": st.column_config.NumberColumn(format="%+.2f"),
+                                "累计盈亏变化": st.column_config.NumberColumn(format="%+.2f"),
                             },
+                        )
+
+                    st.caption(
+                        "情景累计净盈亏 = 历史已实现盈亏 + 情景下未实现盈亏 + 历史净分红。"
+                        "累计盈亏变化展示相对于当前估值的变化。"
+                        "这是基于假设价格的情景分析，不是未来收益预测；不同币种分开计算。"
+                    )
+
+                    # V0.4.0-C decision support section
+                    st.subheader("下一步怎么做？")
+                    st.caption(
+                        "根据你自己设定的持有期限、回撤提醒线和预算，生成透明的风险复核计划。"
+                        "这是规则化情景分析，不是价格预测、个人化买卖指令或自动交易。"
+                    )
+                    with st.form("portfolio_decision_support_form"):
+                        horizon = st.selectbox(
+                            "你计划持有这类投资多久？",
+                            options=["少于 1 年", "1–5 年", "5 年以上"],
+                            index=1,
+                            help="按你自己的计划填写；期限较长并不保证盈利。",
+                        )
+                        review_drawdown = st.slider(
+                            "如果价格从当前估值下跌多少，提醒你重新评估？",
+                            min_value=5,
+                            max_value=30,
+                            value=10,
+                            step=5,
+                            format="%d%%",
+                        )
+                        planned_budget = st.number_input(
+                            "未来考虑投入的新增预算（参考金额；不代表建议买入）",
+                            min_value=0.0,
+                            value=0.0,
+                            step=50.0,
+                            help="填写 0 表示目前不计划追加。多币种持仓时，此预算不自动分配或换汇。",
+                        )
+                        decision_submitted = st.form_submit_button(
+                            "生成我的条件式观察计划",
+                            type="primary",
+                        )
+
+                    if decision_submitted:
+                        try:
+                            st.session_state["portfolio_decision_assessment"] = build_decision_assessment(
+                                positions=positions,
+                                holding_horizon=horizon,
+                                review_drawdown_pct=review_drawdown,
+                                planned_additional_budget=planned_budget,
+                            )
+                            st.session_state["portfolio_decision_preferences"] = {
+                                "holding_horizon": horizon,
+                                "review_drawdown_pct": review_drawdown,
+                                "planned_additional_budget": planned_budget,
+                            }
+                        except Exception as exc:
+                            st.error(f"无法生成观察计划：{type(exc).__name__}: {exc}")
+
+                    decision_result = st.session_state.get("portfolio_decision_assessment")
+                    if decision_result:
+                        st.markdown("#### 你的观察计划")
+                        st.write(decision_result.get("conclusion", ""))
+                        if decision_result.get("horizon_note"):
+                            st.info(decision_result["horizon_note"])
+                        if decision_result.get("budget_note"):
+                            st.caption(decision_result["budget_note"])
+                        for decision_warning in decision_result.get("warnings", []):
+                            st.warning(decision_warning)
+                        for item in decision_result.get("items", []):
+                            with st.container(border=True):
+                                st.markdown(f"**{item['ticker']} · {item['currency']}**")
+                                metric_cols = st.columns(3)
+                                metric_cols[0].metric(
+                                    "当前累计净盈亏",
+                                    f"{item['current_cumulative_net_pnl']:+,.2f} {item['currency']}",
+                                )
+                                metric_cols[1].metric(
+                                    f"价格下跌 {item['review_scenario_drawdown_pct']:.0f}% 的市值变化",
+                                    f"−{item['review_scenario_value_decrease']:,.2f} {item['currency']}",
+                                )
+                                metric_cols[2].metric(
+                                    "该情景下累计净盈亏",
+                                    f"{item['review_scenario_cumulative_net_pnl']:+,.2f} {item['currency']}",
+                                )
+                                st.write(item["review_trigger"])
+                                st.caption(item["interpretation"])
+                        st.caption(
+                            "设置目前保存在当前 Streamlit 会话中。刷新浏览器或重启应用后可能需要重新填写。"
+                            "系统不会因浮亏自动建议加仓，也不会发送或执行交易。"
                         )
 
                     st.subheader("交易历史与已实现盈亏")

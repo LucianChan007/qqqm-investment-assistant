@@ -384,50 +384,91 @@ def build_scenario_table(
     positions: pd.DataFrame,
     changes_pct: Sequence[float] = (-20, -10, -5, 0, 5, 10, 20),
 ) -> pd.DataFrame:
-    """Calculate hypothetical market value and unrealized P&L per position.
+    """Calculate price scenarios for open positions, including total recorded P&L.
 
-    Percent changes are relative to the supplied/current price. Results stay
-    separated by ticker and currency; no foreign-exchange conversion is done.
+    Scenario cumulative P&L is defined as historical realized P&L plus the
+    scenario unrealized P&L plus historical net dividend income. All values
+    remain separated by ticker and currency; no FX conversion is performed.
+    This is a hypothetical sensitivity analysis, not a price forecast.
     """
-    required = {
-        "ticker", "currency", "quantity", "remaining_cost_basis",
-        "current_price", "open_position",
-    }
     output_columns = [
-        "ticker", "currency", "price_change_pct", "scenario_price",
-        "scenario_market_value", "scenario_unrealized_pnl",
+        "ticker",
+        "currency",
+        "price_change_pct",
+        "scenario_price",
+        "scenario_market_value",
+        "scenario_unrealized_pnl",
         "scenario_unrealized_pnl_pct",
+        "realized_pnl",
+        "dividend_income",
+        "current_cumulative_net_pnl",
+        "scenario_cumulative_net_pnl",
+        "cumulative_pnl_change",
     ]
+    required = {
+        "ticker",
+        "currency",
+        "quantity",
+        "remaining_cost_basis",
+        "current_price",
+        "open_position",
+    }
     if positions.empty or not required.issubset(positions.columns):
         return pd.DataFrame(columns=output_columns)
+
+    def safe_float(value, default=0.0):
+        try:
+            number = float(value)
+            return number if pd.notna(number) else default
+        except (TypeError, ValueError):
+            return default
 
     rows: list[dict] = []
     for _, position in positions.iterrows():
         if not bool(position["open_position"]):
             continue
-        current_price = position["current_price"]
-        qty = float(position["quantity"])
-        cost_basis = float(position["remaining_cost_basis"])
-        if pd.isna(current_price) or float(current_price) <= 0:
+
+        current_price = safe_float(position["current_price"], float("nan"))
+        quantity = safe_float(position["quantity"])
+        cost_basis = safe_float(position["remaining_cost_basis"])
+        if pd.isna(current_price) or current_price <= 0 or quantity <= 0:
             continue
 
+        realized = safe_float(position.get("realized_pnl", 0.0))
+        dividends = safe_float(position.get("dividend_income", 0.0))
+        current_market_value = quantity * current_price
+        current_unrealized = current_market_value - cost_basis
+        current_cumulative = realized + current_unrealized + dividends
+
         for change in changes_pct:
-            pct = float(change)
-            scenario_price = float(current_price) * (1 + pct / 100)
-            if scenario_price < 0:
+            pct = safe_float(change, float("nan"))
+            if pd.isna(pct) or pct < -100:
                 continue
-            market_value = qty * scenario_price
-            pnl = market_value - cost_basis
+
+            scenario_price = current_price * (1.0 + pct / 100.0)
+            scenario_market_value = quantity * scenario_price
+            scenario_unrealized = scenario_market_value - cost_basis
+            scenario_cumulative = realized + scenario_unrealized + dividends
+
             rows.append({
                 "ticker": position["ticker"],
                 "currency": position["currency"],
                 "price_change_pct": pct,
                 "scenario_price": scenario_price,
-                "scenario_market_value": market_value,
-                "scenario_unrealized_pnl": pnl,
+                "scenario_market_value": scenario_market_value,
+                "scenario_unrealized_pnl": scenario_unrealized,
                 "scenario_unrealized_pnl_pct": (
-                    pnl / cost_basis * 100 if cost_basis > 0 else float("nan")
+                    scenario_unrealized / cost_basis * 100.0
+                    if cost_basis > 0
+                    else float("nan")
                 ),
+                "realized_pnl": realized,
+                "dividend_income": dividends,
+                "current_cumulative_net_pnl": current_cumulative,
+                "scenario_cumulative_net_pnl": scenario_cumulative,
+                "cumulative_pnl_change": scenario_cumulative - current_cumulative,
             })
 
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
     return pd.DataFrame(rows, columns=output_columns).round(6)
