@@ -1,0 +1,24 @@
+"""Guard rails before automatic intraday forecast/evaluation runs."""
+from __future__ import annotations
+from datetime import datetime, time
+
+
+def evaluate_cycle_gate(
+    now_ny: datetime,
+    is_market_session: bool,
+    latest_data_date: str | None,
+    close_ready_time: time = time(16, 30),
+) -> tuple[bool, str]:
+    """Only proceed after a NASDAQ session and when today's bars were synced."""
+    today = now_ny.date().isoformat()
+    if not is_market_session:
+        return False, f"纽约日期 {today} 不是 NASDAQ 交易日；跳过预测生成。"
+    if now_ny.tzinfo is None:
+        return False, "纽约当前时间缺少时区信息；为避免错误日期，跳过本次流程。"
+    if now_ny.timetz().replace(tzinfo=None) < close_ready_time:
+        return False, f"尚未到收盘后数据检查时间（纽约时间 {close_ready_time.strftime('%H:%M')}）；跳过预测生成。"
+    if not latest_data_date:
+        return False, "行情表中没有找到 QQQM 15 分钟数据；跳过后续步骤。"
+    if latest_data_date != today:
+        return False, f"最新 15 分钟数据日期为 {latest_data_date}，纽约今天是 {today}；数据可能尚未同步完整，跳过新预测。"
+    return True, "交易日已结束且当天 15 分钟数据已同步，继续评估和生成预测。"

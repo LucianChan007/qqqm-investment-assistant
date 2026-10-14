@@ -6,11 +6,14 @@ Runs existing project entry points in sequence:
 1) refresh daily market bars;
 2) sync Fed/BLS news and macro observations;
 3) sync FRED macro series;
-4) generate DeepSeek reports only when market/news/macro data changed.
+4) settle saved next-session forecasts against newly available actual closes;
+5) when QQQM's market date advances, refit the current return-model candidates,
+   save a new forecast, and record it for later evaluation;
+6) generate DeepSeek reports only when market/news/macro data changed.
 
 Run from the repository root:
     python -m app.daily_automation --dry-run
-    python -m app.daily_automation --period 1y
+    python -m app.daily_automation
     python -m app.daily_automation --force-ai
     python -m app.daily_automation --status
 """
@@ -329,6 +332,21 @@ class AutomationRunner:
         else:
             self.logger.info("按参数跳过 FRED 宏观数据同步。")
 
+        # Classify pending news after syncing sources but before the new forecast
+        # is generated. The context archive then includes only articles whose
+        # publication AND classification timestamps precede forecast generation.
+        if not self.args.skip_news:
+            self.run_command(
+                "新闻事件结构化分类（待处理新闻，最多 10 条）",
+                [
+                    sys.executable,
+                    "scripts/classify_news_events.py",
+                    "--limit", "10",
+                    "--batch-size", "8",
+                ],
+                timeout=self.args.timeout,
+            )
+
         after = snapshot_data()
         before_dates = before["market_dates"]
         after_dates = after["market_dates"]
@@ -344,41 +362,53 @@ class AutomationRunner:
         self.logger.info("行情日期发生变化的标的：%s", ", ".join(updated_market_tickers) or "无")
         self.logger.info("新增新闻：%d 条；新增宏观观测：%d 条", new_news_count, new_macro_count)
 
+        # Run forecast feedback on every automation invocation. If QQQM's actual
+        # market date advanced, the cycle evaluates yesterday's predictions and
+        # generates/records a new forecast. On holidays or duplicate runs, only
+        # evaluate existing forecasts so we do not create a fresh forecast from
+        # stale prices. Dry-run records the planned full cycle without executing it.
+        if self.args.dry_run or "QQQM" in updated_market_tickers:
+            forecast_cycle_args: list[str] = []
+        else:
+            forecast_cycle_args = ["--evaluate-only"]
+        self.run_command(
+            "预测反馈与每日模型更新",
+            [sys.executable, "scripts/run_forecast_daily_cycle.py", *forecast_cycle_args],
+            timeout=self.args.timeout,
+        )
+
         if not self.args.skip_ai:
+            if self.args.force_ai:
+                ai_targets = [ticker for ticker in ai_tickers if ticker in after_dates]
+                trigger_reason = "用户指定强制生成"
+            else:
+                ai_targets = [ticker for ticker in ai_tickers if ticker in updated_market_tickers]
+                if new_news_count > 0 or new_macro_count > 0:
+                    ai_targets = normalize_tickers([*ai_targets, *[t for t in ai_tickers if t in after_dates]])
+                trigger_reason = "行情日期更新或发现新增新闻/宏观数据"
+
             if self.args.dry_run:
-                # A dry run cannot know which data will change after real sync.
-                # Show the AI command as a conditional plan, without making API calls.
-                planned_targets = ai_tickers
-                self.logger.info(
-                    "演练模式：实际运行时，仅在行情/新闻/宏观数据发生变化时调用 AI；"
-                    "以下仅展示可能执行的报告命令。"
-                )
-                for ticker in planned_targets:
+                # Dry-run reports planned AI targets without issuing model requests.
+                if self.args.force_ai:
+                    ai_targets = ai_tickers
+                elif not ai_targets:
+                    ai_targets = []
+                for ticker in ai_targets:
                     self.run_command(
-                        f"DeepSeek 分析（条件计划）：{ticker}",
+                        f"DeepSeek 分析（演练）：{ticker}",
                         [sys.executable, "main.py", "analyze", "--ticker", ticker, "--with-macro"],
                         timeout=self.args.timeout,
                     )
+            elif not ai_targets:
+                self.logger.info("没有检测到新行情/新新闻/新宏观观测，跳过 DeepSeek，避免重复消耗额度。")
             else:
-                if self.args.force_ai:
-                    ai_targets = [ticker for ticker in ai_tickers if ticker in after_dates]
-                    trigger_reason = "用户指定强制生成"
-                else:
-                    ai_targets = [ticker for ticker in ai_tickers if ticker in updated_market_tickers]
-                    if new_news_count > 0 or new_macro_count > 0:
-                        ai_targets = normalize_tickers([*ai_targets, *[t for t in ai_tickers if t in after_dates]])
-                    trigger_reason = "行情日期更新或发现新增新闻/宏观数据"
-
-                if not ai_targets:
-                    self.logger.info("没有检测到新行情/新新闻/新宏观观测，跳过 DeepSeek，避免重复消耗额度。")
-                else:
-                    self.logger.info("触发 AI 分析原因：%s", trigger_reason)
-                    for ticker in ai_targets:
-                        self.run_command(
-                            f"DeepSeek 分析：{ticker}",
-                            [sys.executable, "main.py", "analyze", "--ticker", ticker, "--with-macro"],
-                            timeout=self.args.timeout,
-                        )
+                self.logger.info("触发 AI 分析原因：%s", trigger_reason)
+                for ticker in ai_targets:
+                    self.run_command(
+                        f"DeepSeek 分析：{ticker}",
+                        [sys.executable, "main.py", "analyze", "--ticker", ticker, "--with-macro"],
+                        timeout=self.args.timeout,
+                    )
         else:
             self.logger.info("按参数跳过 AI 分析。")
 
@@ -425,9 +455,9 @@ def show_status() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="自动同步行情、Fed/BLS 新闻、FRED 宏观数据，并在数据变化时生成 DeepSeek 报告。"
+        description="自动同步行情与宏观信息、复盘并更新下一交易日预测、按需生成 DeepSeek 报告。"
     )
-    parser.add_argument("--period", default="1y", help="日常同步行情范围，默认 1y；支持项目行情源可接受的 period，例如 1y、5y、max")
+    parser.add_argument("--period", default="30d", help="日常同步行情范围，默认 30d；也支持 1y/5y/max")
     parser.add_argument("--tickers", nargs="+", help="额外同步标的；默认读取 app.config、持仓 CSV 并包含 QQQM")
     parser.add_argument("--ai-tickers", nargs="+", default=DEFAULT_AI_TICKERS,
                         help="允许自动生成 AI 报告的标的，默认仅 QQQM，控制 API 成本")

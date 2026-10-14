@@ -1,0 +1,42 @@
+from __future__ import annotations
+import unittest
+from datetime import datetime, date, time
+from zoneinfo import ZoneInfo
+
+from app.services.intraday_cycle_guard import evaluate_cycle_gate
+
+NY = ZoneInfo("America/New_York")
+
+class IntradayCycleGuardTests(unittest.TestCase):
+    def test_proceeds_after_session_when_today_bars_exist(self):
+        now = datetime(2026, 10, 14, 20, 50, tzinfo=NY)
+        proceed, reason = evaluate_cycle_gate(now, True, "2026-10-14")
+        self.assertTrue(proceed)
+        self.assertIn("继续", reason)
+
+    def test_skips_before_close_ready_time(self):
+        now = datetime(2026, 10, 14, 15, 45, tzinfo=NY)
+        proceed, reason = evaluate_cycle_gate(now, True, "2026-10-14")
+        self.assertFalse(proceed)
+        self.assertIn("尚未到收盘后", reason)
+
+    def test_skips_holiday_or_weekend(self):
+        now = datetime(2026, 10, 17, 20, 50, tzinfo=NY)
+        proceed, reason = evaluate_cycle_gate(now, False, "2026-10-16")
+        self.assertFalse(proceed)
+        self.assertIn("不是 NASDAQ 交易日", reason)
+
+    def test_skips_if_data_is_stale(self):
+        now = datetime(2026, 10, 14, 20, 50, tzinfo=NY)
+        proceed, reason = evaluate_cycle_gate(now, True, "2026-10-13")
+        self.assertFalse(proceed)
+        self.assertIn("数据可能尚未同步完整", reason)
+
+    def test_rejects_naive_datetime(self):
+        now = datetime(2026, 10, 14, 20, 50)
+        proceed, reason = evaluate_cycle_gate(now, True, "2026-10-14")
+        self.assertFalse(proceed)
+        self.assertIn("缺少时区", reason)
+
+if __name__ == "__main__":
+    unittest.main()
